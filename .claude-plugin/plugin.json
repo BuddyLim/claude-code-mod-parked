@@ -1,6 +1,6 @@
 {
   "name": "parked",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A per-project backlog of items needing your attention, parked by you or the orchestrator",
   "author": { "name": "Kuang Tar Lim" },
   "license": "MIT",

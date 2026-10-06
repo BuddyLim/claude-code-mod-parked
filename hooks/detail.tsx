@@ -35,10 +35,15 @@ type DetailProps = {
   actions: Action[]
   // Whether the thread has findings the Send row can pass to the main agent.
   canSend: boolean
+  // How many options the item offers: a digit up to it answers with that one.
+  options: number
+  // Whether the composer sends the user's answer to the main agent.
+  isAnswering: boolean
   note: string
   resolution: string
   // The ticket's rows, how many its window shows, and how far it is scrolled.
-  ticket: string[]
+  // Each row is the pieces it is drawn in, a glyph's piece with its colour.
+  ticket: { text: string; color?: string; shade?: boolean }[][]
   ticketRows: number
   top: number
   // The thread's rows, how many its window shows, and how far the pane's own
@@ -167,8 +172,6 @@ const List = (props: ListProps, surface: ClientSurface<State>) => {
       move(cursor + height)
     } else if (key === 'return' || key === 'right') {
       open(cursor)
-    } else if (/^[1-9]$/.test(key)) {
-      open(Number(key) - 1)
     }
   })
 
@@ -206,7 +209,7 @@ const List = (props: ListProps, surface: ClientSurface<State>) => {
               <Text wrap="truncate-end">
                 <Text color="cyan">{isHere ? '▸ ' : '  '}</Text>
                 <Text color={entry.tone}>{entry.glyph} </Text>
-                <Text dimColor>{at < 9 ? `${at + 1} ` : '  '}</Text>
+                <Text dimColor>#{entry.id} </Text>
                 <Text inverse={isHere} dimColor={entry.isDone && !isHere}>
                   {entry.text}
                 </Text>
@@ -218,7 +221,7 @@ const List = (props: ListProps, surface: ClientSurface<State>) => {
       </Box>
       <Text dimColor>{'─'.repeat(props.columns)}</Text>
       <Text dimColor wrap="truncate-end">
-        click once for keys · ↑↓ or j k move · enter, → or l opens · 1-9 open · esc releases
+        click once for keys · ↑↓ or j k move · enter, → or l opens · esc releases
       </Text>
     </Box>
   )
@@ -347,6 +350,10 @@ const Detail = (props: DetailProps, surface: ClientSurface<State>) => {
       run(props.actions[pick]?.act)
     } else if (key === 's') {
       run('send')
+    } else if (/^[1-9]$/.test(key)) {
+      if (Number(key) <= props.options) {
+        run(`pick-${key}`)
+      }
     } else {
       run(props.actions.find(action => action.hot === key)?.act)
     }
@@ -386,12 +393,16 @@ const Detail = (props: DetailProps, surface: ClientSurface<State>) => {
   const topAt = clamp(props.top, 0, Math.max(0, props.ticket.length - props.ticketRows))
   const end = props.talk.length - backAt
   const shown = props.talk.slice(Math.max(0, end - props.threadRows), end)
+  // With options, what answers them leads the hint: the row is cut at the edge.
+  const picks = props.options > 0 ? `1-${props.options} answer · ` : ''
   const hint =
     tier === TICKETS
-      ? '←→ or h l switch ticket · ↓ or j actions · i composer'
+      ? `${picks}←→ or h l switch ticket · ↓ or j actions · i composer`
       : tier === ACTIONS
-        ? '←→ or h l choose · enter or o runs · ↑↓ or k j levels'
-        : 'typing in the composer · enter sends · ↑ leaves it'
+        ? `${picks}←→ or h l choose · enter or o runs · ↑↓ or k j levels`
+        : props.isAnswering
+          ? 'answering the main agent · enter sends · ↑ leaves it'
+          : 'typing in the composer · enter sends · ↑ leaves it'
 
   return (
     <Box flexDirection="column">
@@ -441,11 +452,23 @@ const Detail = (props: DetailProps, surface: ClientSurface<State>) => {
         </Text>
       )}
       <Box flexDirection="column" height={props.ticketRows} overflow="hidden">
-        {props.ticket.slice(topAt, topAt + props.ticketRows).map(text => (
-          <Text wrap="truncate-end" bold={text.startsWith('#')}>
-            {text === '' ? ' ' : text}
-          </Text>
-        ))}
+        {props.ticket.slice(topAt, topAt + props.ticketRows).map(parts =>
+          // A row of the user's own note: shaded under a ❯, as a prompt is.
+          parts[0]?.shade === true ? (
+            <Text backgroundColor="userMessageBackground">
+              <Text dimColor>{parts[0].text.slice(0, 2)}</Text>
+              {parts[0].text.slice(2)}
+            </Text>
+          ) : (
+            <Text wrap="truncate-end" bold={parts[0]?.text.startsWith('#') === true}>
+              {parts.length === 0
+                ? ' '
+                : parts.map(part =>
+                    part.color === undefined ? <Text>{part.text}</Text> : <Text color={part.color}>{part.text}</Text>,
+                  )}
+            </Text>
+          ),
+        )}
       </Box>
       <Text dimColor>{'─'.repeat(props.columns)}</Text>
       <Box justifyContent="space-between">
