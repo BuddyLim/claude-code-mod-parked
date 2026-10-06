@@ -87,6 +87,9 @@ them.
   option). These need the click; without one, reach Accept and Answer on the
   actions row.
 - `d` done, `r` reopen, `n` next, `p` previous, `b` back to the list.
+- `g` opens the item's file reference in the [lens](https://github.com/BuddyLim/claude-code-mod-lens)
+  mod, where that is installed; with several references, each press opens the
+  next.
 - `i` jumps to the composer.
 - `s` sends the thread's summary to the main agent, once the subagent has
   replied.
