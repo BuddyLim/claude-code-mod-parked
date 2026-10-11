@@ -1,7 +1,7 @@
 {
   "name": "parked",
-  "version": "0.2.0",
-  "description": "A per-project backlog of items needing your attention, parked by you or the orchestrator",
+  "version": "0.3.0",
+  "description": "A backlog of items needing your attention, parked by you or the orchestrator, kept per session and listed across them",
   "author": { "name": "Kuang Tar Lim" },
   "license": "MIT",
   "repository": "https://github.com/BuddyLim/claude-code-mod-parked",

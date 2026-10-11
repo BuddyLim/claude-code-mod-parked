@@ -1,13 +1,22 @@
-import type { ParkedItem, ParkedKind, ParkedMessage } from '../types'
+import type { ParkedItem, ParkedKind, ParkedMessage, ParkedScope, ParkedSession } from '../types'
 import type { LedgerFindingSeen, LedgerRunSeen } from '../types/ledger'
-import { FILE_COLOR, FILE_ICONS, FOLDER_COLOR, ICON, STAR_COLOR, refIcon } from './kit/icons'
+import { ICON, refIcon } from './kit/icons'
 
 // What of the ledger's run has already been turned into items: the tasks whose
 // gate stood failed, and the findings a review item has carried. An item is
 // made when one of these changes, so one the user closed is not made again.
 export type LedgerSeen = { gates: string[]; findings: number[] }
 
-export type Backlog = { nextId: number; items: ParkedItem[]; seen?: LedgerSeen }
+// One backlog holds every session's items. `seen` is what the ledger's run has
+// been through in the one session a call is about; `ledger` keeps it for each
+// session, and `sessions` is what the pane names each session by.
+export type Backlog = {
+  nextId: number
+  items: ParkedItem[]
+  seen?: LedgerSeen
+  ledger?: Record<string, LedgerSeen>
+  sessions?: Record<string, ParkedSession>
+}
 
 export const EMPTY: Backlog = { nextId: 1, items: [] }
 
@@ -24,6 +33,8 @@ export type NewItem = {
   origin?: ParkedItem['origin']
   parkedBy: 'model' | 'user'
   sessionId: string
+  project?: string
+  source?: string
   now: number
 }
 
@@ -35,37 +46,6 @@ export const isBacklog = (value: unknown): value is Backlog =>
 
 // The glyphs and their colours are the kit's, shared with lens and ledger.
 export { ICON }
-
-// The colour each glyph that leads a ticket row is drawn in.
-const LEAD_COLORS: Record<string, string> = {
-  ...Object.fromEntries(FILE_ICONS.map(([, glyph, color]) => [glyph, color])),
-  [ICON.file]: FILE_COLOR,
-  [ICON.folderOpen]: FOLDER_COLOR,
-  [ICON.options]: 'cyan',
-}
-
-export type TicketPart = { text: string; color?: string }
-
-// One row of the ticket as the pieces it is drawn in: the glyph that leads it
-// and the default's star take a colour, the rest is plain.
-export const ticketParts = (row: string): TicketPart[] => {
-  const lead = /^(\s*)(\S) (.*)$/u.exec(row)
-  const color = lead === null ? undefined : LEAD_COLORS[lead[2] ?? '']
-  const head: TicketPart[] =
-    lead === null || color === undefined
-      ? []
-      : [...(lead[1] === '' ? [] : [{ text: lead[1] ?? '' }]), { text: `${lead[2]} `, color }]
-  const rest = head.length === 0 ? row : (lead?.[3] ?? '')
-  const mark = `${ICON.preferred} default`
-  const at = rest.indexOf(mark)
-
-  return [
-    ...head,
-    ...(at === -1
-      ? [{ text: rest }]
-      : [{ text: rest.slice(0, at) }, { text: mark, color: STAR_COLOR }, { text: rest.slice(at + mark.length) }]),
-  ].filter(part => part.text !== '')
-}
 
 // The glyph of a ref's file type; a ref is a path, or path:line.
 export const fileIcon = (ref: string): string => refIcon(ref).glyph
@@ -85,7 +65,7 @@ export const park = (backlog: Backlog, item: NewItem): Backlog => ({
       id: backlog.nextId,
       kind: item.kind,
       title: item.title,
-      body: item.body,
+      body: tidyBody(item.body),
       ...(item.note ? { note: item.note } : {}),
       ...(item.options !== undefined && item.options.length > 0
         ? { options: defaultFirst(item.options, item.preferred) }
@@ -97,7 +77,9 @@ export const park = (backlog: Backlog, item: NewItem): Backlog => ({
       ...(item.origin !== undefined ? { origin: item.origin } : {}),
       parkedBy: item.parkedBy,
       sessionId: item.sessionId,
+      ...(item.project ? { project: item.project } : {}),
       createdAt: item.now,
+      ...(item.source ? { source: item.source } : {}),
       status: 'open',
     },
   ],
@@ -152,7 +134,7 @@ export const statusText = (items: readonly ParkedItem[]): string | undefined => 
   const open = items.filter(one => one.status === 'open')
   const needs = open.filter(one => one.kind === 'needs-you').length
   const blocking = open.filter(one => one.kind === 'needs-you' && one.isBlocking === true).length
-  const fyi = open.length - needs
+  const fyi = open.filter(one => one.kind === 'fyi').length
   const parts = [
     needs > 0 ? `${needs} need${needs === 1 ? 's' : ''} attention${blocking > 0 ? ` (${blocking} blocking)` : ''}` : '',
     fyi > 0 ? `${fyi} FYI` : '',
@@ -171,11 +153,14 @@ export const titleOf = (note: string, reply: string): string => {
   return first.length > 80 ? `${first.slice(0, 79)}…` : first
 }
 
-export { ageOf } from './kit/layout'
+import { ageOf } from './kit/layout'
 
-export const describe = (item: ParkedItem): string =>
+export { ageOf }
+
+// `from` names the session an item of another session was parked in.
+export const describe = (item: ParkedItem, from = ''): string =>
   [
-    `#${item.id} [${item.kind}] ${item.title}${item.status === 'done' ? ' (done)' : ''}`,
+    `#${item.id} [${item.kind}] ${item.title}${item.status === 'done' ? ' (done)' : ''}${from === '' ? '' : ` (parked in ${from})`}`,
     item.note ? `Note: ${item.note}` : '',
     item.isBlocking === true && item.status === 'open' ? 'Blocking: work is waiting on the user.' : '',
     item.body,
@@ -216,18 +201,37 @@ export const say = (
 const lastOf = (item: ParkedItem, role: ParkedMessage['role']) =>
   (item.thread ?? []).findLast(one => one.role === role)
 
+// What the user and the subagent said in a thread: the mod's own notes and the
+// handover it keeps there are not part of the conversation.
+const spoken = (item: ParkedItem) =>
+  (item.thread ?? []).filter(one => one.role === 'you' || one.role === 'agent')
+
+const INVESTIGATE = [
+  'You are helping the user look into one parked item from a long orchestration session, in a side thread the main agent does not see.',
+  'Investigate with your tools as far as the question needs, then answer the user directly and concisely. Do not change any files unless the user asks you to.',
+]
+
 // What a fresh subagent is told: the item, the thread so far and the new message.
-export const investigationPrompt = (item: ParkedItem, text: string, brief = ''): string =>
+// The line a briefing sent on its own, after the subagent started, opens with.
+export const BRIEFING = 'Briefing from the main session, written for you from its full context:'
+
+// With `isBriefComing`, the briefing is still being written and follows as a
+// message: the subagent starts at once on what it can check itself.
+export const investigationPrompt = (item: ParkedItem, text: string, brief = '', isBriefComing = false): string =>
   [
-    'You are helping the user look into one parked item from a long orchestration session, in a side thread the main agent does not see.',
-    'Investigate with your tools as far as the question needs, then answer the user directly and concisely. Do not change any files unless the user asks you to.',
+    ...INVESTIGATE,
+    ...(isBriefComing
+      ? [
+          'A briefing from the main session, written from its full context, will reach you as a message within about half a minute. Start now with what you can check yourself, and take the briefing into account when it arrives.',
+        ]
+      : []),
     '',
     `Parked item #${item.id} [${item.kind}]: ${item.title}`,
     item.body,
     item.note ? `The user's note: ${item.note}` : '',
-    ...(brief.trim() !== '' ? ['', 'Briefing from the main session, written for you from its full context:', brief.trim()] : []),
-    ...((item.thread ?? []).some(one => one.role !== 'note')
-      ? ['', 'Earlier in this thread:', ...(item.thread ?? []).filter(one => one.role !== 'note').map(one => `${one.role === 'you' ? 'User' : 'You'}: ${one.text}`)]
+    ...(brief.trim() !== '' ? ['', BRIEFING, brief.trim()] : []),
+    ...(spoken(item).length > 0
+      ? ['', 'Earlier in this thread:', ...spoken(item).map(one => `${one.role === 'you' ? 'User' : 'You'}: ${one.text}`)]
       : []),
     '',
     `The user's message: ${text}`,
@@ -251,8 +255,7 @@ export const summaryRequest = (item: ParkedItem): string =>
     '',
     'Side thread:',
     // The newest part of a long thread is the part that holds its conclusion.
-    (item.thread ?? [])
-      .filter(one => one.role !== 'note')
+    spoken(item)
       .map(one => `${one.role === 'you' ? 'User' : 'Subagent'}: ${one.text}`)
       .join('\n\n')
       .slice(-12000),
@@ -289,25 +292,6 @@ export const doneNote = (item: ParkedItem): string => {
   return `Marked done by you after a side thread. Last finding: ${line.length > 140 ? `${line.slice(0, 139)}…` : line}`
 }
 
-// Splits text into rows no wider than `width`, so a region of the pane can show
-// a window of them; a wrapped list line keeps its indent.
-export const wrap = (text: string, width: number): string[] =>
-  text.split('\n').flatMap(line => {
-    const clean = line.replace(/\*\*(.+?)\*\*/g, '$1').trimEnd()
-    const indent = Math.min(clean.match(/^\s*(?:[-*]\s+|\d+\.\s+)?/)?.[0].length ?? 0, Math.max(0, width - 10))
-    const rows: string[] = []
-    let rest = clean
-
-    while (rest.length > width) {
-      const space = rest.lastIndexOf(' ', width)
-      const cut = space > indent ? space : width
-      rows.push(rest.slice(0, cut))
-      rest = ' '.repeat(indent) + rest.slice(cut).trimStart()
-    }
-
-    return [...rows, rest]
-  })
-
 // What the main session is asked, in a fork of its own context, so a thread's
 // subagent starts with the background an orchestrator would hand it.
 export const briefRequest = (item: ParkedItem): string =>
@@ -322,8 +306,8 @@ export const briefRequest = (item: ParkedItem): string =>
   ].join('\n')
 
 // The order the pane lists items in, which Next and Prev walk: open items that
-// need the user (those blocking work first), then open FYIs, then the ten most
-// recently parked done items.
+// need the user (those blocking work first), then open FYIs, then what the
+// assistant parked for itself, then the ten most recently parked done items.
 export const orderOf = (items: readonly ParkedItem[]): ParkedItem[] => {
   const open = items.filter(one => one.status === 'open')
 
@@ -331,17 +315,10 @@ export const orderOf = (items: readonly ParkedItem[]): ParkedItem[] => {
     ...open.filter(one => one.kind === 'needs-you' && one.isBlocking === true),
     ...open.filter(one => one.kind === 'needs-you' && one.isBlocking !== true),
     ...open.filter(one => one.kind === 'fyi'),
+    ...open.filter(one => one.kind === 'self'),
     ...items.filter(one => one.status === 'done').slice(-10).reverse(),
   ]
 }
-
-// A thread as one Markdown text, for the formatted view.
-export const threadText = (item: ParkedItem): string =>
-  (item.thread ?? [])
-    .map(one =>
-      one.role === 'note' ? `*· ${one.text}*` : `**${one.role === 'you' ? 'You' : 'Subagent'}**\n\n${one.text}`,
-    )
-    .join('\n\n')
 
 // A reply's text with spacing and Markdown marks removed, cut short: two
 // routes deliver the same report with different escaping and indentation.
@@ -358,79 +335,51 @@ export const sayOnce = (backlog: Backlog, id: number, message: ParkedMessage): B
     : say(backlog, id, message)
 }
 
-export type ParkedAction = { act: 'done' | 'reopen' | 'next' | 'prev' | 'back'; label: string; hot: string }
-
-// The actions an item's row offers, in the order ← and → walk them.
-export const actionsOf = (order: readonly ParkedItem[], item: ParkedItem): ParkedAction[] => {
-  const at = order.findIndex(one => one.id === item.id)
-
-  return [
-    item.status === 'open'
-      ? { act: 'done', label: 'Done', hot: 'd' }
-      : { act: 'reopen', label: 'Reopen', hot: 'r' },
-    ...(at < order.length - 1 ? [{ act: 'next', label: 'Next', hot: 'n' } as const] : []),
-    ...(at > 0 ? [{ act: 'prev', label: 'Prev', hot: 'p' } as const] : []),
-    { act: 'back', label: 'Back', hot: 'b' },
-  ]
-}
-
-export type ThreadLine = { text: string; kind: 'you' | 'dot' | 'text' | 'note' }
-
-// A thread as rows a window can show a slice of. The user's message is shaded
-// rows under a ❯, as a prompt is; a reply opens with a dot and its later
-// rows are indented under it; a note is one dim line. A blank row parts them.
-export const threadLines = (thread: readonly ParkedMessage[], columns: number): ThreadLine[] =>
-  thread.flatMap((one, index): ThreadLine[] => {
-    const gap: ThreadLine[] = index > 0 ? [{ text: '', kind: 'text' }] : []
-
-    if (one.role === 'you') {
-      // As Claude Code draws a prompt: a ❯ on the first row, later rows
-      // indented under it, each row padded so its shading runs the full width.
-      return [
-        ...gap,
-        ...wrap(one.text, Math.max(4, columns - 2)).map(
-          (text, at): ThreadLine => ({ text: `${at === 0 ? '❯' : ' '} ${text}`.padEnd(columns), kind: 'you' }),
-        ),
-      ]
-    }
-
-    if (one.role === 'note') {
-      return [...gap, ...wrap(`· ${one.text}`, columns).map((text): ThreadLine => ({ text, kind: 'note' }))]
-    }
-
-    return [
-      ...gap,
-      ...wrap(one.text, Math.max(4, columns - 2)).map(
-        (text, at): ThreadLine => ({ text: `${at === 0 ? '●' : ' '} ${text}`, kind: at === 0 ? 'dot' : 'text' }),
-      ),
-    ]
-  })
-
-// What the ticket region shows: the choices first, so they are in view however
-// long the body is, then the body, then the places it is about.
-export const ticketText = (item: ParkedItem): string =>
-  [
-    item.options !== undefined
-      ? [
-          `${ICON.options} Options`,
-          ...item.options.map(
-            (label, at) =>
-              `  ${at + 1}. ${label}${item.preferred === at + 1 ? `  ${ICON.preferred} default` : ''}`,
-          ),
-        ].join('\n')
-      : '',
-    item.body,
-    item.refs !== undefined
-      ? [`${ICON.folderOpen} Files`, ...item.refs.map(ref => `  ${fileIcon(ref)} ${ref}`)].join('\n')
-      : '',
-  ]
-    .filter(Boolean)
-    .join('\n\n')
-
 const optionText = (item: ParkedItem, at: number) => `option ${at}, ${item.options?.[at - 1] ?? ''}`
 
 // `text` is the answer as the main agent reads it. A silent answer is not sent
 // at all: the user took the default of an item the agent had gone ahead on.
+// What a subagent answers when a briefing that reached it after its reply
+// changes nothing.
+const NO_CHANGE = /^\W*no change\W*$/i
+
+// What a briefing sent after the subagent started asks of it, should it reach
+// the subagent once its answer is already given: one answer, not two.
+export const BRIEFING_LATE =
+  'If you had already given your answer when this reached you: give the whole answer again only if this briefing changes it, and otherwise reply with just the words NO CHANGE.'
+
+// Adds a subagent's reply to a thread. A second reply to the same message of
+// the user's is the first one thought again (a briefing reached the subagent
+// after it had answered): it takes the first one's place, or is dropped when
+// the subagent says nothing changed. The same reply arriving twice is kept once.
+export const sayReply = (backlog: Backlog, id: number, message: ParkedMessage): Backlog | string => {
+  const thread = backlog.items.find(one => one.id === id)?.thread ?? []
+  const from = thread.findLastIndex(one => one.role === 'you') + 1
+  const earlier = thread.findLastIndex((one, at) => at >= from && one.role === 'agent')
+
+  if (earlier === -1) {
+    return sayOnce(backlog, id, message)
+  }
+
+  if (NO_CHANGE.test(message.text) || gist(thread[earlier]?.text ?? '') === gist(message.text)) {
+    return backlog
+  }
+
+  return {
+    ...backlog,
+    items: backlog.items.map(one =>
+      one.id === id
+        ? {
+            ...one,
+            thread: (one.thread ?? []).map((said, at) =>
+              at === earlier ? { ...message, tools: [...(said.tools ?? []), ...(message.tools ?? [])] } : said,
+            ),
+          }
+        : one,
+    ),
+  }
+}
+
 export type ParkedAnswer = { text: string; isSilent: boolean }
 
 // The user's answer to an item: an option by its number (a typed number names
@@ -680,44 +629,6 @@ export const syncLedger = (
   return same(after, seen) && next === backlog ? backlog : { ...next, seen: after }
 }
 
-export type TicketLine = { text: string; isNote: boolean; color?: string }
-
-// The ticket as rows a window can show a slice of. What the user parked is in
-// labelled sections: "Your note", shaded under a ❯ as a prompt is, then
-// "Assistant reply" under a dot, as the assistant's replies are drawn. What
-// the agent parked is its own description and is drawn plain, with no label.
-export const ticketLines = (item: ParkedItem, columns: number): TicketLine[] => {
-  const note = (item.note ?? '').trim()
-  const body = ticketText(item)
-  const inner = Math.max(4, columns - 2)
-  const isReply = item.parkedBy === 'user'
-  const noteRows: TicketLine[] =
-    note === ''
-      ? []
-      : [
-          { text: 'Your note:', isNote: false, color: 'warning' },
-          ...wrap(note, inner).map((text, at) => ({
-            text: `${at === 0 ? '❯' : ' '} ${text}`.padEnd(columns),
-            isNote: true,
-          })),
-        ]
-  const bodyRows: TicketLine[] =
-    body === ''
-      ? []
-      : isReply
-        ? [
-            { text: 'Assistant reply:', isNote: false, color: 'cyan' },
-            ...wrap(body, inner).map((text, at) => ({ text: `${at === 0 ? '●' : ' '} ${text}`, isNote: false })),
-          ]
-        : wrap(body, columns).map(text => ({ text, isNote: false }))
-
-  return [
-    ...noteRows,
-    ...(noteRows.length > 0 && bodyRows.length > 0 ? [{ text: '', isNote: false }] : []),
-    ...bodyRows,
-  ]
-}
-
 // Every run the ledger keeps, as the one view `syncLedger` reads: the tasks of
 // the runs under way, and the findings of all. A task id names one task among
 // the runs under way and a finding's number one finding, so nothing clashes.
@@ -742,3 +653,479 @@ export const placeOfRef = (ref: string): { path: string; line: number } => {
 
   return at === null ? { path: ref.trim(), line: 0 } : { path: at[1] ?? '', line: Number(at[2]) }
 }
+
+// How many lines of a file an item shows above and below the one referred to.
+const PEEK_BEFORE = 6
+const PEEK_AFTER = 30
+
+// The part of a file an item shows for a reference: the lines around the one
+// referred to, or its first lines when the reference names the file alone,
+// within what one Code element draws.
+export const excerptOf = (text: string, line: number): { start: number; source: string } => {
+  const lines = text.replace(/\r\n?/g, '\n').replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '').split('\n')
+  const start = Math.max(1, Math.min(line - PEEK_BEFORE, lines.length))
+  const taken: string[] = []
+  let size = 0
+
+  for (const one of lines.slice(start - 1, start - 1 + PEEK_BEFORE + PEEK_AFTER + 1)) {
+    // A line longer than the pane is wide is cut: a minified file is one line.
+    const cut = one.length > 400 ? `${one.slice(0, 399)}…` : one
+
+    if (size + cut.length + 1 > 9000) {
+      break
+    }
+
+    taken.push(cut)
+    size += cut.length + 1
+  }
+
+  return { start, source: taken.join('\n') }
+}
+
+// A text with the user's home folder written `~`, as a shell prompt has it.
+// Only a whole folder name counts: `/Users/kim` is not shortened in
+// `/Users/kimberly`.
+export const tildeOf = (text: string, home: string): string =>
+  home === '' || home === '/'
+    ? text
+    : text.split(home).reduce((joined, part) => `${joined}${/^[\w.-]/.test(part) ? home : '~'}${part}`)
+
+// A body as the Markdown the pane draws. A model sometimes sends the two
+// characters `\n` where it meant a line break: a body with no line break at
+// all that holds them is read that way.
+export const tidyBody = (body: string): string => {
+  const text = body.replace(/\r\n?/g, '\n')
+  const isEscaped = !text.includes('\n') && text.includes('\\n')
+
+  return (isEscaped ? text.replace(/\\n/g, '\n').replace(/\\t/g, '  ') : text).trim()
+}
+
+const TABLE_RULE = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/
+
+// A table row's cells, without the bars at its ends.
+const cellsOf = (row: string): string[] =>
+  row
+    .trim()
+    .replace(/^\|/, '')
+    .replace(/\|$/, '')
+    .split(/(?<!\\)\|/)
+    .map(cell => cell.trim().replace(/\\\|/g, '|'))
+
+// A cell as plain text, for a table drawn in fixed columns.
+const plain = (cell: string) => cell.replace(/\*\*(.+?)\*\*/g, '$1').replace(/`([^`]*)`/g, '$1')
+
+// Markdown with its tables made to fit a pane. The Markdown element lays a
+// table out for a width of its own, not the pane's, so in a narrow pane every
+// row wraps and the grid is lost. A table that fits `width` is drawn here in
+// fixed columns inside a code fence, where spacing is kept; one that does not
+// becomes a list, each row an entry and each further cell a line named by its
+// column. Tables inside a code fence are left alone.
+export const fitTables = (text: string, width: number): string => {
+  const lines = text.split('\n')
+  const out: string[] = []
+  let isFenced = false
+
+  for (let at = 0; at < lines.length; at += 1) {
+    const line = lines[at] ?? ''
+
+    if (/^\s*(```|~~~)/.test(line)) {
+      isFenced = !isFenced
+    }
+
+    const rule = lines[at + 1] ?? ''
+
+    if (isFenced || !line.includes('|') || !rule.includes('-') || !TABLE_RULE.test(rule)) {
+      out.push(line)
+
+      continue
+    }
+
+    const head = cellsOf(line)
+    const rows: string[][] = []
+    let end = at + 2
+
+    for (; end < lines.length && (lines[end] ?? '').includes('|') && (lines[end] ?? '').trim() !== ''; end += 1) {
+      rows.push(cellsOf(lines[end] ?? ''))
+    }
+
+    const all = [head, ...rows].map(row => head.map((_, column) => plain(row[column] ?? '')))
+    const widths = head.map((_, column) => Math.max(...all.map(row => (row[column] ?? '').length)))
+    const fits = widths.reduce((sum, one) => sum + one, 0) + 3 * (head.length - 1) <= width
+
+    if (fits) {
+      const drawn = all.map(row => row.map((cell, column) => cell.padEnd(widths[column] ?? 0)).join(' │ ').trimEnd())
+
+      out.push('```', drawn[0] ?? '', widths.map(one => '─'.repeat(one)).join('─┼─'), ...drawn.slice(1), '```')
+    } else {
+      for (const row of rows) {
+        out.push(`- **${row[0] ?? ''}**`)
+        out.push(
+          ...head.flatMap((name, column) =>
+            column === 0 || (row[column] ?? '') === '' ? [] : [`  - ${name === '' ? '' : `${name}: `}${row[column]}`],
+          ),
+        )
+      }
+    }
+
+    at = end - 1
+  }
+
+  return out.join('\n')
+}
+
+// The most one Markdown element draws is 10000 characters.
+const MARKDOWN_MOST = 9000
+
+// A text as the pieces Markdown elements draw, one each: cut at a blank line
+// where there is one, else at a line's end, and free of the control characters
+// an element refuses.
+export const markdownOf = (text: string, most = MARKDOWN_MOST): string[] => {
+  const chunks: string[] = []
+  let rest = text.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '')
+
+  while (rest.length > most) {
+    const blank = rest.lastIndexOf('\n\n', most)
+    const line = rest.lastIndexOf('\n', most)
+    const at = blank > most / 2 ? blank : line > most / 2 ? line : most
+
+    chunks.push(rest.slice(0, at))
+    rest = rest.slice(at).replace(/^\n+/, '')
+  }
+
+  return rest.trim() === '' ? chunks : [...chunks, rest]
+}
+
+// Where a session is and what it is asking about: its id and its project root.
+export type Here = { sessionId: string; project: string }
+
+// The items a scope lists: this session's, those of every session in this
+// project, or all of them.
+export const inScope = (items: readonly ParkedItem[], scope: ParkedScope, here: Here): ParkedItem[] =>
+  items.filter(
+    one =>
+      scope === 'all' ||
+      one.sessionId === here.sessionId ||
+      (scope === 'project' && one.project !== undefined && one.project === here.project),
+  )
+
+const SCOPES: readonly ParkedScope[] = ['session', 'project', 'all']
+
+export const nextScope = (scope: ParkedScope): ParkedScope =>
+  SCOPES[(SCOPES.indexOf(scope) + 1) % SCOPES.length] ?? 'session'
+
+// What the pane calls a session: the name /resume lists it under, or the start
+// of its id while it has none.
+export const sessionLabel = (
+  sessions: Readonly<Record<string, ParkedSession>> | undefined,
+  sessionId: string,
+): string => {
+  const name = sessions?.[sessionId]?.name ?? ''
+
+  return name !== '' ? name : `session ${sessionId.slice(0, 8)}`
+}
+
+// Records what a session is called and where it runs. Answers the same backlog
+// when it already says so.
+export const knowSession = (
+  backlog: Backlog,
+  sessionId: string,
+  seen: { name: string; project: string; transcript?: string },
+  now: number,
+): Backlog => {
+  const known = backlog.sessions?.[sessionId]
+  // A name once found is kept when a later look finds none.
+  const name = seen.name !== '' ? seen.name : (known?.name ?? '')
+  const transcript = seen.transcript ?? known?.transcript
+
+  if (known !== undefined && known.name === name && known.project === seen.project && known.transcript === transcript) {
+    return backlog
+  }
+
+  return {
+    ...backlog,
+    sessions: {
+      ...backlog.sessions,
+      [sessionId]: { name, project: seen.project, ...(transcript !== undefined ? { transcript } : {}), seenAt: now },
+    },
+  }
+}
+
+// What `grep -o -E` is given to find a transcript's title rows, and the name
+// they give a session: the one the user set, else the one Claude Code made.
+export const TITLE_ROWS = '"type":"(custom-title|agent-name|ai-title)","[A-Za-z]+":"([^"\\\\]|\\\\.)*"'
+
+export const sessionNameOf = (found: string): string => {
+  const names: Record<string, string> = {}
+
+  for (const line of found.split('\n')) {
+    try {
+      const row: Record<string, unknown> = JSON.parse(`{${line}}`)
+      const name = Object.entries(row).find(([key]) => key !== 'type')?.[1]
+
+      if (typeof row.type === 'string' && typeof name === 'string' && name.trim() !== '') {
+        names[row.type] = name.trim()
+      }
+    } catch {
+      // Not a title row.
+    }
+  }
+
+  return names['custom-title'] ?? names['agent-name'] ?? names['ai-title'] ?? ''
+}
+
+// The backlog before this one was kept per folder. Those are joined into one,
+// oldest item first and numbered afresh, each item keeping its folder as its
+// project and each session what the ledger had been through.
+export const migrate = (old: readonly (readonly [project: string, backlog: Backlog])[]): Backlog => {
+  const items = old
+    .flatMap(([project, backlog]) => backlog.items.map(one => ({ ...one, project: one.project ?? project })))
+    .sort((a, b) => a.createdAt - b.createdAt)
+    .map((one, at) => {
+      // A subagent belongs to the session that started it, long over.
+      const { agentId: _a, ...rest } = one
+
+      return { ...rest, id: at + 1 }
+    })
+  const ledger = Object.fromEntries(
+    old.flatMap(([, backlog]) => {
+      const seen = backlog.seen
+
+      return seen === undefined ? [] : backlog.items.map(one => [one.sessionId, seen] as const)
+    }),
+  )
+
+  return { nextId: items.length + 1, items, ...(Object.keys(ledger).length > 0 ? { ledger } : {}) }
+}
+
+// `syncLedger` for the one session whose ledger changed: its items alone are
+// brought in step, and every other session's are left as they are.
+export const syncSession = (
+  backlog: Backlog,
+  run: LedgerRunSeen | null | undefined,
+  now: number,
+  here: Here,
+): Backlog => {
+  const seen = backlog.ledger?.[here.sessionId]
+  const mine: Backlog = {
+    nextId: backlog.nextId,
+    items: backlog.items.filter(one => one.sessionId === here.sessionId),
+    ...(seen !== undefined ? { seen } : {}),
+  }
+  const after = syncLedger(mine, run, now, here.sessionId)
+
+  if (after === mine) {
+    return backlog
+  }
+
+  return {
+    ...backlog,
+    nextId: after.nextId,
+    items: [
+      ...backlog.items.filter(one => one.sessionId !== here.sessionId),
+      ...after.items.map(one => (one.project === undefined && here.project !== '' ? { ...one, project: here.project } : one)),
+    ].sort((a, b) => a.id - b.id),
+    ...(after.seen !== undefined ? { ledger: { ...backlog.ledger, [here.sessionId]: after.seen } } : {}),
+  }
+}
+
+// A reference as the file it names: a path that is not absolute is from the
+// project the item was parked in, which need not be the folder the session is
+// in now, and `~` is the user's home.
+export const pathOfRef = (item: ParkedItem, ref: string, home: string): string => {
+  const named = placeOfRef(ref).path
+  const isFromProject = item.project !== undefined && !/^[/~]/.test(named)
+
+  return (isFromProject ? `${item.project}/${named}` : named).replace(/^~(?=\/|$)/, home)
+}
+
+// Puts items back as they were before something was done to them, by id.
+// Answers which of them had an answer the agent has already been told: taking
+// the item back does not take that back.
+export const restore = (
+  backlog: Backlog,
+  before: readonly ParkedItem[],
+): { backlog: Backlog; told: number[] } => {
+  const was = new Map(before.map(one => [one.id, one]))
+  const told = backlog.items
+    .filter(one => was.has(one.id) && one.answer !== undefined && one.isUnsent !== true && !/^You accepted the default/.test(one.resolution ?? ''))
+    .map(one => one.id)
+
+  return { backlog: { ...backlog, items: backlog.items.map(one => was.get(one.id) ?? one) }, told }
+}
+
+// The open items whose answer can be the agent's own pick: a choice with a
+// default. Taking them all is one press after a run left unattended.
+export const defaultsOf = (items: readonly ParkedItem[]): ParkedItem[] =>
+  items.filter(one => one.status === 'open' && one.kind === 'needs-you' && one.preferred !== undefined)
+
+// What a session is told as it opens with items of its own waiting: how many
+// need the user, and how long the oldest has waited. Nothing when none does.
+export const digestOf = (items: readonly ParkedItem[], now: number): string | undefined => {
+  const needs = items.filter(one => one.status === 'open' && one.kind === 'needs-you')
+  const blocking = needs.filter(one => one.isBlocking === true).length
+
+  if (needs.length === 0) {
+    return undefined
+  }
+
+  const oldest = Math.min(...needs.map(one => one.createdAt))
+
+  return `Parked: ${needs.length} need${needs.length === 1 ? 's' : ''} your attention${blocking > 0 ? `, ${blocking} blocking` : ''}, the oldest for ${ageOf(oldest, now)}. /parked shows them.`
+}
+
+// What the agent is asked when the user hands it its own list to work through.
+export const workPrompt = (own: readonly ParkedItem[]): string =>
+  [
+    `Go through the ${own.length === 1 ? 'item' : `${own.length} items`} you parked for yourself, now:`,
+    ...own.map(one => `- #${one.id} ${one.title}`),
+    'Read each in full with the list tool first. Do the ones you can and resolve each as it is done. For one you cannot do yet, say what it is waiting on and leave it open.',
+  ].join('\n')
+
+// What a tool call gave back, as the one line a thread shows under the call:
+// its first line, and how many more there were. The result is a tool_result's
+// content: text, or blocks of which the text ones count.
+export const resultLine = (content: unknown): string => {
+  const text =
+    typeof content === 'string'
+      ? content
+      : Array.isArray(content)
+        ? content
+            .map(block => (typeof block === 'object' && block !== null && 'text' in block ? String(block.text) : ''))
+            .join('\n')
+        : ''
+  const lines = text
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '')
+    .split('\n')
+    .filter(line => line.trim() !== '')
+  const first = (lines[0] ?? '').trim()
+
+  if (first === '') {
+    return '(nothing)'
+  }
+
+  return `${first.length > 90 ? `${first.slice(0, 89)}…` : first}${lines.length > 1 ? ` (+${lines.length - 1} lines)` : ''}`
+}
+
+// What the assistant parked for itself in a session and has not done.
+export const ownOpen = (items: readonly ParkedItem[], sessionId: string): ParkedItem[] =>
+  items.filter(one => one.kind === 'self' && one.status === 'open' && one.sessionId === sessionId)
+
+// How many prompts may pass before the assistant is reminded of them again.
+const REMIND_EVERY = 6
+
+// Whether a turn should open with a reminder: when the list is not the one
+// last reminded of, or enough prompts have passed since.
+export const isReminderDue = (
+  own: readonly ParkedItem[],
+  last: { ids: string; turns: number },
+): boolean => own.length > 0 && (own.map(one => one.id).join(',') !== last.ids || last.turns >= REMIND_EVERY)
+
+// The reminder itself, a note only the assistant reads.
+export const reminderOf = (own: readonly ParkedItem[]): string =>
+  [
+    `You parked ${own.length === 1 ? 'this' : 'these'} for yourself and ${own.length === 1 ? 'it is' : 'they are'} still open:`,
+    ...own.map(one => `- #${one.id} ${one.title}`),
+    'This is a reminder, not a request from the user. Come back to them when the current work allows, resolve each one as it is done, and do not report the work finished while one is open without saying so.',
+  ].join('\n')
+
+// How many done items are kept; the pane lists the newest ten.
+const DONE_KEPT = 200
+
+// Drops the done items closed longest ago once there are more than are kept,
+// so the store, which holds every session's, stays small.
+export const pruned = (backlog: Backlog): Backlog => {
+  const done = backlog.items.filter(one => one.status === 'done')
+
+  if (done.length <= DONE_KEPT) {
+    return backlog
+  }
+
+  const dropped = new Set(
+    done
+      .sort((a, b) => (a.resolvedAt ?? a.createdAt) - (b.resolvedAt ?? b.createdAt))
+      .slice(0, done.length - DONE_KEPT)
+      .map(one => one.id),
+  )
+
+  return { ...backlog, items: backlog.items.filter(one => !dropped.has(one.id)) }
+}
+
+// The handover a thread's subagent starts with, as the user reads it in the
+// thread: its instructions, the briefing and their message. The ticket itself
+// is in view above, so it is named and not repeated.
+export const handoverOf = (item: ParkedItem, text: string, brief: string): string =>
+  [
+    ...INVESTIGATE,
+    '',
+    `**Ticket:** #${item.id} ${item.title}, with its full text${item.note ? ' and your note' : ''}.`,
+    '',
+    '**Briefing from the main session**, sent to the subagent as a follow-up once it was written:',
+    '',
+    brief.trim() !== ''
+      ? brief.trim()
+      : '_None: the main session had no context to give, so the subagent has the ticket only._',
+    ...((item.thread ?? []).some(one => one.role === 'agent') ? ['', '**Earlier in this thread:** every message so far.'] : []),
+    '',
+    `**Your message:** ${text}`,
+  ].join('\n')
+
+const ESCAPES: Record<string, string> = { n: '\n', t: '\t', r: '', b: '', f: '' }
+
+// The string values in a piece of JSON that may stop anywhere, each decoded;
+// the last may be unfinished. A tool call's arguments arrive that way, and a
+// subagent's report is one of them.
+export const stringsIn = (json: string): string[] => {
+  const found: string[] = []
+  let at = 0
+
+  while (at < json.length) {
+    if (json[at] !== '"') {
+      at += 1
+
+      continue
+    }
+
+    let end = at + 1
+    let text = ''
+
+    for (; end < json.length && json[end] !== '"'; end += 1) {
+      const mark = json[end + 1]
+
+      if (json[end] !== '\\') {
+        text += json[end]
+      } else if (mark === undefined || (mark === 'u' && end + 6 > json.length)) {
+        // An escape cut short: the text stops before it.
+        end = json.length
+      } else if (mark === 'u') {
+        text += String.fromCharCode(Number.parseInt(json.slice(end + 2, end + 6), 16))
+        end += 5
+      } else {
+        text += ESCAPES[mark] ?? mark
+        end += 1
+      }
+    }
+
+    // A value follows a colon; any other string is a key.
+    if (json.slice(Math.max(0, at - 8), at).trimEnd().endsWith(':')) {
+      found.push(text)
+    }
+
+    at = end + 1
+  }
+
+  return found
+}
+
+// A tool call as a thread's row names it, as the transcript does: the tool and
+// the first of its arguments, `Read(src/queue.ts)`. The arguments may still be
+// arriving. A plugin's or a server's tool goes by its own name.
+export const callLabel = (name: string, json: string): string => {
+  const first = (stringsIn(json)[0] ?? '').replace(/\s+/g, ' ').trim()
+  const tool = name.replace(/^mcp__(.+?)__/, '$1: ')
+
+  return first === '' ? tool : `${tool}(${first.length > 70 ? `${first.slice(0, 69)}…` : first})`
+}
+
+// The report in a hand-back call's arguments so far: its longest text.
+export const reportIn = (json: string): string =>
+  stringsIn(json).reduce((longest, one) => (one.length > longest.length ? one : longest), '')
